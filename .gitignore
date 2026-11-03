@@ -1,0 +1,34 @@
+# SBOM output — generated per run, never committed. Keeping one in git would give a
+# reader a dependency list that stopped being true the moment anything was upgraded.
+*.cdx.json
+sbom.cdx.json
+image.cdx.json
+
+# Node
+node_modules/
+.pnpm-store/
+npm-debug.log*
+yarn-error.log*
+
+# Go
+bin/
+vendor/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets — nothing here should ever hold one, so these exist to make an accident
+# loud rather than to make it tidy.
+.env
+.env.*
+*.pem
+*.key
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

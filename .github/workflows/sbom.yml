@@ -1,0 +1,254 @@
+# Generate a CycloneDX SBOM and upload it to Dependency-Track.
+#
+# The Azure DevOps equivalent is infrastructure/vsts-pipeline-templates templates/cdx/*.
+# This is a port, not a reimplementation: the collector commands and the upload call are
+# kept identical on purpose, because the two are supposed to produce the same component
+# count for the same repository. Where something here looks oddly specific, it is
+# carrying a failure the AzDO side already paid for; those are commented individually.
+name: SBOM
+
+on:
+  workflow_call:
+    inputs:
+      sbom-type:
+        description: "golang | npm | yarn | php"
+        required: true
+        type: string
+      dt-project:
+        description: "Project name in Dependency-Track. Must already be declared in deptrk/projects.yaml and integrations.yaml."
+        required: true
+        type: string
+      dt-parent:
+        description: "Parent container in DT. Must already exist; it is never auto-created."
+        required: false
+        type: string
+        default: ""
+      dt-parent-version:
+        required: false
+        type: string
+        default: "latest"
+      dt-tags:
+        description: "Comma-separated, e.g. tier=website,language=npm"
+        required: false
+        type: string
+        default: ""
+      dt-url:
+        required: false
+        type: string
+        default: "https://security.outlays.ws"
+      dt-project-version:
+        description: "Defaults to the branch or tag name. NOT the commit SHA -- a SHA would leave one project version row per commit instead of updating one."
+        required: false
+        type: string
+        default: ""
+      go-main:
+        description: "For golang: path to the main package, e.g. ./cmd/app"
+        required: false
+        type: string
+        default: ""
+      pnpm-filter:
+        description: "For npm: workspace package name"
+        required: false
+        type: string
+        default: ""
+      php-dir:
+        required: false
+        type: string
+        default: "."
+      php-flavour:
+        description: "composer | php | wordpress"
+        required: false
+        type: string
+        default: "composer"
+      min-third-party:
+        description: "Floor. Below this the SBOM is refused rather than uploaded."
+        required: false
+        type: number
+        default: 10
+      node-version:
+        required: false
+        type: string
+        default: "22"
+      go-version:
+        required: false
+        type: string
+        default: "1.26"
+      cdxgen-version:
+        required: false
+        type: string
+        default: "11.11.0"
+      runs-on:
+        required: false
+        type: string
+        default: "ubuntu-latest"
+    secrets:
+      DEPTRK_API_KEY:
+        required: true
+      CF_ACCESS_CLIENT_ID:
+        required: false
+      CF_ACCESS_CLIENT_SECRET:
+        required: false
+
+jobs:
+  sbom:
+    name: SBOM (${{ inputs.dt-project }})
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          case "${{ inputs.sbom-type }}" in
+            golang|npm|yarn|php) ;;
+            *) echo "::error::sbom-type must be golang, npm, yarn or php (got '${{ inputs.sbom-type }}')"; exit 1 ;;
+          esac
+          # Fail here rather than three steps later with an empty SBOM and a confusing
+          # floor-guard message about a collector that was never given a target.
+          if [ "${{ inputs.sbom-type }}" = "golang" ] && [ -z "${{ inputs.go-main }}" ]; then
+            echo "::error::sbom-type=golang requires go-main (e.g. ./cmd/app)"; exit 1
+          fi
+          if [ "${{ inputs.sbom-type }}" = "npm" ] && [ -z "${{ inputs.pnpm-filter }}" ]; then
+            echo "::error::sbom-type=npm requires pnpm-filter (the workspace package name)"; exit 1
+          fi
+
+      # --- Go: per-binary, not per-module -----------------------------------------
+      # cyclonedx-gomod with -main walks ONE main package's build graph. `cdxgen -t golang`
+      # would read go.mod and report the module's whole closure, so every binary in a
+      # multi-main repo would get an identical, over-broad SBOM.
+      - name: Set up Go
+        if: inputs.sbom-type == 'golang'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+      - name: Generate Go SBOM
+        if: inputs.sbom-type == 'golang'
+        run: |
+          set -euo pipefail
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          cyclonedx-gomod app -main "${{ inputs.go-main }}" -licenses -json -output sbom.cdx.json .
+
+      # --- Node / PHP: cdxgen ------------------------------------------------------
+      - name: Set up Node
+        if: inputs.sbom-type != 'golang'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Install cdxgen
+        if: inputs.sbom-type != 'golang'
+        run: npm install -g "@cyclonedx/cdxgen@${{ inputs.cdxgen-version }}"
+
+      - name: Generate npm (pnpm) SBOM
+        if: inputs.sbom-type == 'npm'
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm install --frozen-lockfile
+          DEPLOY_DIR="${RUNNER_TEMP}/sbom-deploy"
+          # `pnpm deploy` produces a HOISTED node_modules for one workspace package.
+          # cdxgen cannot resolve pnpm's symlinked store layout, so without this it walks
+          # almost nothing and returns an SBOM made of our own workspace packages -- which
+          # is what min-third-party exists to catch.
+          pnpm --filter "${{ inputs.pnpm-filter }}" deploy --prod --legacy "$DEPLOY_DIR" \
+            || pnpm --filter "${{ inputs.pnpm-filter }}" deploy --legacy "$DEPLOY_DIR"
+          cdxgen -t npm -o sbom.cdx.json "$DEPLOY_DIR"
+
+      - name: Generate yarn SBOM
+        if: inputs.sbom-type == 'yarn'
+        run: |
+          set -euo pipefail
+          yarn install --production --frozen-lockfile
+          cdxgen -t npm -o sbom.cdx.json .
+
+      - name: Generate PHP SBOM
+        if: inputs.sbom-type == 'php'
+        run: |
+          set -euo pipefail
+          # All three flavours need composer.lock. cdxgen does NOT read WordPress plugin
+          # headers: php/composer/wordpress are aliases of one collector, and on a classic
+          # wp-content tree it exits 0 and writes no file at all.
+          if [ ! -f "${{ inputs.php-dir }}/composer.lock" ]; then
+            echo "::error::${{ inputs.php-dir }}/composer.lock not found. cdxgen needs it for every PHP flavour, including wordpress."; exit 1
+          fi
+          cdxgen -t "${{ inputs.php-flavour }}" --required-only -o sbom.cdx.json "${{ inputs.php-dir }}"
+
+      # --- The guard ----------------------------------------------------------------
+      - name: Check the SBOM is not empty
+        run: |
+          set -euo pipefail
+          python3 - "sbom.cdx.json" "${{ inputs.min-third-party }}" <<'PYGUARD'
+          import json, sys, os
+          bom, floor = sys.argv[1], int(sys.argv[2])
+          if not os.path.exists(bom):
+              sys.exit(f"REFUSING TO PUBLISH: {bom} was never written. The collector exited "
+                       f"without producing anything, which is not the same as a clean result.")
+          b = json.load(open(bom))
+          comps = b.get("components", [])
+          third = [c for c in comps if not str(c.get("group") or "").startswith(("@outlays.cloud", "@wanted"))]
+          print(f"SBOM: {len(comps)} components, {len(third)} third-party (floor {floor})")
+          if len(third) < floor:
+              sys.exit(
+                  f"REFUSING TO PUBLISH: only {len(third)} third-party components, below the "
+                  f"floor of {floor}. An SBOM made almost entirely of our own packages means "
+                  f"the collector did not resolve the dependency tree. Uploading it would "
+                  f"report this project as monitored while nothing is actually scanned.")
+          PYGUARD
+
+      - name: Upload to Dependency-Track
+        env:
+          DEPTRK_API_KEY: ${{ secrets.DEPTRK_API_KEY }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          PROJVER="${{ inputs.dt-project-version }}"
+          [ -n "$PROJVER" ] || PROJVER="${GITHUB_REF_NAME}"
+
+          # --form-string, NOT -F, for every non-file field. curl treats a leading '@' as a
+          # file reference, so a scoped package name like "@outlays.cloud/shim" in
+          # projectName makes it try to open a file and fail with error 26.
+          FORM_ARGS=(
+            --form-string "autoCreate=true"
+            --form-string "isLatest=true"
+            --form-string "projectName=${{ inputs.dt-project }}"
+            --form-string "projectVersion=${PROJVER}"
+            --form-string "projectTags=${{ inputs.dt-tags }}"
+            -F "bom=@sbom.cdx.json;type=application/json"
+          )
+          if [ -n "${{ inputs.dt-parent }}" ]; then
+            FORM_ARGS+=( --form-string "parentName=${{ inputs.dt-parent }}"
+                         --form-string "parentVersion=${{ inputs.dt-parent-version }}" )
+          fi
+
+          # Cloudflare Access fronts security.outlays.ws. Without the service token the
+          # request follows a 302 into an HTML login page, and the failure reads as a
+          # rejected API key rather than a missing header.
+          CF_ARGS=()
+          if [ -n "${CF_ACCESS_CLIENT_ID:-}" ]; then
+            CF_ARGS+=( -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}"
+                       -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}" )
+          fi
+
+          echo "Uploading '${{ inputs.dt-project }}' @ ${PROJVER}"
+          # POST, not PUT: PUT expects a base64 JSON body and 415s on multipart.
+          # Retried, because one transient 503 should not need a human to re-run a build.
+          for attempt in 1 2 3; do
+            CODE=$(curl -sS -o /tmp/dt.out -w '%{http_code}' --max-time 120 \
+              -X POST "${{ inputs.dt-url }}/api/v1/bom" \
+              -H "X-Api-Key: ${DEPTRK_API_KEY}" \
+              "${CF_ARGS[@]}" "${FORM_ARGS[@]}") && true
+            case "$CODE" in
+              200|201) echo "uploaded (HTTP $CODE)"; exit 0 ;;
+              5*|000)  echo "attempt $attempt: HTTP $CODE, retrying"; sleep $((attempt * 5)) ;;
+              *)       echo "::error::upload failed (HTTP $CODE): $(head -c 300 /tmp/dt.out)"; exit 1 ;;
+            esac
+          done
+          echo "::error::upload failed after 3 attempts: $(head -c 300 /tmp/dt.out)"; exit 1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom-${{ inputs.dt-project }}
+          path: sbom.cdx.json
+          if-no-files-found: warn
